@@ -2,10 +2,13 @@ package org.openmetadata.it.tests;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.openmetadata.common.utils.CommonUtil.listOrEmpty;
 
+import java.net.URI;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.function.Executable;
@@ -14,6 +17,7 @@ import org.openmetadata.it.factories.UserTestFactory;
 import org.openmetadata.it.util.SdkClients;
 import org.openmetadata.it.util.TestNamespace;
 import org.openmetadata.it.util.TestNamespaceExtension;
+import org.openmetadata.schema.api.events.CreateEventSubscription;
 import org.openmetadata.schema.entity.app.App;
 import org.openmetadata.schema.entity.app.AppMarketPlaceDefinition;
 import org.openmetadata.schema.entity.app.AppSchedule;
@@ -24,17 +28,24 @@ import org.openmetadata.schema.entity.app.NativeAppPermission;
 import org.openmetadata.schema.entity.app.ScheduleTimeline;
 import org.openmetadata.schema.entity.app.ScheduleType;
 import org.openmetadata.schema.entity.app.ScheduledExecutionContext;
+import org.openmetadata.schema.entity.events.EventSubscription;
+import org.openmetadata.schema.entity.events.SubscriptionDestination;
 import org.openmetadata.schema.entity.teams.User;
+import org.openmetadata.schema.type.EntityReference;
+import org.openmetadata.schema.type.Webhook;
 import org.openmetadata.schema.utils.JsonUtils;
 import org.openmetadata.sdk.exceptions.OpenMetadataException;
 import org.openmetadata.sdk.network.HttpClient;
 import org.openmetadata.sdk.network.HttpMethod;
 import org.openmetadata.sdk.network.RequestOptions;
+import org.openmetadata.service.Entity;
+import org.openmetadata.service.jdbi3.AppRepository;
 
 /**
- * An app's alerts come from its own code, never from its marketplace definition. A signed-up user
- * can own an app and its definition, since neither has an owner, so whatever an install did with
- * the definition was theirs to decide.
+ * An app's alerts come from its own code, never from its marketplace definition, and only the
+ * server records them on the app (ADR:2026-10-26-an-apps-alerts-come-from-its-code). A signed-up
+ * user can own an app and its definition, since neither has an owner, so whatever the app or its
+ * definition holds was theirs to decide.
  */
 // Installs and deletes apps, which walks every app's scheduler job: isolated like AppsResourceIT.
 @Isolated
@@ -66,6 +77,43 @@ class AppEventSubscriptionRemovalIT {
       owned.asOwner().executeForString(HttpMethod.POST, "/v1/apps/schedule/" + appName, null);
 
       assertAlertMissing(alertName);
+    } finally {
+      uninstall(appName);
+    }
+  }
+
+  @Test
+  void deletingAnAppLeavesAnotherUsersAlertAlone(final TestNamespace ns) throws Exception {
+    final String appName = "keepApp" + System.currentTimeMillis();
+    try {
+      final EventSubscription alert = webhookAlert(ns);
+      final OwnedApp owned = ownedApp(ns, appName);
+      final String appPath = "/v1/apps/" + owned.app().getId();
+
+      assertBadRequest(() -> patch(owned.asOwner(), appPath, linkedAlert(alert.getId())));
+      owned.asOwner().execute(HttpMethod.DELETE, appPath + "?hardDelete=true", null, Void.class);
+
+      assertEquals(alert.getId(), adminAlert(alert.getId()).getId());
+    } finally {
+      uninstall(appName);
+    }
+  }
+
+  @Test
+  void theServerRecordsEachAlertAnAppCreatesOnce(final TestNamespace ns) throws Exception {
+    final String appName = "ownApp" + System.currentTimeMillis();
+    try {
+      final EventSubscription alert = webhookAlert(ns);
+      final App app = createApp(createDefinition(appName));
+      final AppRepository repository =
+          (AppRepository) Entity.getEntityRepository(Entity.APPLICATION);
+
+      repository.addEventSubscription(app, alert);
+      repository.addEventSubscription(app, alert);
+      assertEquals(List.of(alert.getId()), storedAlertIds(app.getId()));
+
+      repository.deleteEventSubscription(app, alert.getId());
+      assertEquals(List.of(), storedAlertIds(app.getId()));
     } finally {
       uninstall(appName);
     }
@@ -113,6 +161,26 @@ class AppEventSubscriptionRemovalIT {
     return admin().execute(HttpMethod.POST, "/v1/apps", request, App.class);
   }
 
+  private static EventSubscription webhookAlert(final TestNamespace ns) {
+    final SubscriptionDestination webhook =
+        new SubscriptionDestination()
+            .withCategory(SubscriptionDestination.SubscriptionCategory.EXTERNAL)
+            .withType(SubscriptionDestination.SubscriptionType.WEBHOOK)
+            .withConfig(new Webhook().withEndpoint(URI.create("http://localhost:9999/kept")));
+    final EventSubscription alert =
+        SdkClients.adminClient()
+            .eventSubscriptions()
+            .create(
+                new CreateEventSubscription()
+                    .withName(ns.prefix("kept"))
+                    .withAlertType(CreateEventSubscription.AlertType.NOTIFICATION)
+                    .withResources(List.of("table"))
+                    .withEnabled(true)
+                    .withDestinations(List.of(webhook)));
+    ns.trackRoot(Entity.EVENT_SUBSCRIPTION, alert.getId());
+    return alert;
+  }
+
   private static void claim(final HttpClient client, final String path, final User user) {
     final Map<String, Object> owner = Map.of("id", user.getId().toString(), "type", "user");
     patch(client, path, List.of(Map.of("op", "add", "path", "/owners", "value", List.of(owner))));
@@ -136,6 +204,12 @@ class AppEventSubscriptionRemovalIT {
         Map.of("op", "add", "path", "/description", "value", "Edited by its owner"));
   }
 
+  private static List<Map<String, Object>> linkedAlert(final UUID alertId) {
+    final Map<String, Object> reference =
+        Map.of("id", alertId.toString(), "type", Entity.EVENT_SUBSCRIPTION);
+    return List.of(Map.of("op", "add", "path", EVENT_SUBSCRIPTIONS, "value", List.of(reference)));
+  }
+
   private static void patch(
       final HttpClient client, final String path, final List<Map<String, Object>> operations) {
     client.executeForString(HttpMethod.PATCH, path, JsonUtils.pojoToJson(operations), JSON_PATCH);
@@ -151,6 +225,17 @@ class AppEventSubscriptionRemovalIT {
             OpenMetadataException.class,
             () -> SdkClients.adminClient().eventSubscriptions().getByName(alertName));
     assertEquals(404, missing.getStatusCode());
+  }
+
+  private static EventSubscription adminAlert(final UUID alertId) {
+    return SdkClients.adminClient().eventSubscriptions().get(alertId.toString());
+  }
+
+  private static List<UUID> storedAlertIds(final UUID appId) {
+    final App stored = admin().execute(HttpMethod.GET, "/v1/apps/" + appId, null, App.class);
+    return listOrEmpty(stored.getEventSubscriptions()).stream()
+        .map(EntityReference::getId)
+        .toList();
   }
 
   private static HttpClient admin() {
