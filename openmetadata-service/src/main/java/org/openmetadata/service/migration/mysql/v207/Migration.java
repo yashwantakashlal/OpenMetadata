@@ -15,6 +15,7 @@ package org.openmetadata.service.migration.mysql.v207;
 
 import org.openmetadata.service.migration.api.MigrationProcessImpl;
 import org.openmetadata.service.migration.utils.MigrationFile;
+import org.openmetadata.service.migration.utils.v207.AppCreatedAlerts;
 import org.openmetadata.service.migration.utils.v207.MigrationUtil;
 
 public class Migration extends MigrationProcessImpl {
@@ -26,5 +27,7 @@ public class Migration extends MigrationProcessImpl {
   @Override
   public void runDataMigration() {
     MigrationUtil.addWorkflowRunEntityLinkIndexOnMySql(handle);
+    // The 2.0.7 post-data SQL disables these alerts; their names go to the log first.
+    AppCreatedAlerts.logForReviewOnMySql(handle);
   }
 }
